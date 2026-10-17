@@ -1,0 +1,56 @@
+name: 試運転（EDINETとSECに入れるか確かめる）
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: EDINETで調べる日（YYYY-MM-DD）。有価証券報告書が多い6月下旬の平日がおすすめ
+        default: "2026-06-26"
+
+permissions:
+  contents: read
+
+jobs:
+  trial:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      EDINET_API_KEY: ${{ secrets.EDINET_API_KEY }}
+      SEC_CONTACT: ${{ secrets.SEC_CONTACT }}
+      TARGET_DATE: ${{ inputs.date }}
+    steps:
+      - name: EDINET（日本株）
+        run: |
+          if [ -z "$EDINET_API_KEY" ]; then echo "EDINET_API_KEY が空です。Secretの名前を確かめてください"; exit 1; fi
+          code=$(curl -s -o edinet.json -w "%{http_code}" "https://api.edinet-fsa.go.jp/api/v2/documents.json?date=${TARGET_DATE}&type=2&Subscription-Key=${EDINET_API_KEY}")
+          echo "EDINET HTTPの結果: $code"
+          python3 - <<'PY'
+          import json
+          try:
+              d = json.load(open("edinet.json"))
+          except Exception as e:
+              print("JSONとして読めませんでした:", type(e).__name__)
+              raise SystemExit(0)
+          meta = d.get("metadata", {})
+          print("EDINETの返事:", meta.get("status") or d.get("statusCode"), meta.get("message") or d.get("message"))
+          rs = d.get("results", [])
+          yuho = [r for r in rs if r.get("docTypeCode") == "120" and r.get("secCode")]
+          print("書類の数:", len(rs), "/ 有価証券報告書（証券コードあり）:", len(yuho))
+          PY
+
+      - name: SEC（米国株）
+        run: |
+          if [ -z "$SEC_CONTACT" ]; then echo "SEC_CONTACT が空です。Secretの名前を確かめてください"; exit 1; fi
+          code=$(curl -s --compressed -A "$SEC_CONTACT" -o frame.json -w "%{http_code}" "https://data.sec.gov/api/xbrl/frames/us-gaap/CommonStockDividendsPerShareDeclared/USD-per-shares/CY2025.json")
+          echo "SEC（data.sec.gov）HTTPの結果: $code"
+          sleep 1
+          code2=$(curl -s --compressed -A "$SEC_CONTACT" -o tickers.json -w "%{http_code}" "https://www.sec.gov/files/company_tickers.json")
+          echo "SEC（www.sec.gov）HTTPの結果: $code2"
+          python3 - <<'PY'
+          import json
+          try:
+              d = json.load(open("frame.json"))
+              print("SECの会社数（1株配当 CY2025）:", len(d.get("data", [])))
+          except Exception as e:
+              print("frame.json はJSONとして読めませんでした:", type(e).__name__)
+          PY
