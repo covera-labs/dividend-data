@@ -4,14 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       big_from:
-        description: 大手企業を探す期間の最初の日（YYYY-MM-DD）。3月決算の会社は6月下旬に報告書を出します
-        default: "2026-06-17"
+        description: 大手企業を探す期間の最初の日（YYYY-MM-DD）。3月決算の会社は6月に報告書を出します
+        default: "2026-06-01"
       big_to:
         description: 大手企業を探す期間の最後の日
         default: "2026-06-30"
       codes:
         description: 試したい会社の証券コード（4桁、カンマ区切り）
-        default: "7203,9432,8306,8058,6758,4502"
+        default: "7203,9432,8058,9984,8035"
       reit_from:
         description: REITとETFを探す期間の最初の日
         default: "2026-09-01"
@@ -130,7 +130,8 @@ jobs:
                   return (first, r[0].split(":")[-1], r[2])
 
               per = sorted([r for r in rows if is_div_per(r[0].split(":")[-1])], key=prio)
-              table = sorted([r for r in rows if "FilingDateInstant_Row" in r[2]], key=prio)
+              table = sorted([r for r in rows if "FilingDateInstant_Row" in r[2]
+                              and "DividendsOfSurplus" in r[0] and "TextBlock" not in r[0]], key=prio)
               good = any(("当期" in r[3]) and any(ch.isdigit() for ch in r[8]) and ("PerShare" in r[0] or "PerUnit" in r[0])
                          and "Interim" not in r[0] for r in per)
               contexts = Counter(shorten_ctx(r[2]) for r in per)
@@ -138,7 +139,7 @@ jobs:
               for r in per[:12]:
                   lines.append(f"{r[0].split(':')[-1].replace('SummaryOfBusinessResults', '')} | {shorten_ctx(r[2])} | {r[3]} | {r[6]} | {r[8][:18]}")
               tl = []
-              for r in table[:12]:
+              for r in table[:16]:
                   tl.append(f"{r[0].split(':')[-1]} | {shorten_ctx(r[2])} | {r[8][:28]}")
               note(f"EDINET {code4}",
                    f"{head}\n行数{len(rows)} / ファイル{len(names)}個 / 配当の行{len(per)} / 当期の1株配当: {'あり' if good else 'なし'}\n"
@@ -153,6 +154,8 @@ jobs:
                   sys.exit(1)
               pool, kinds, scanned, bad = [], Counter(), 0, []
               found = {}
+              seen = {}  # 指定した会社が、絞り込む前の一覧に出た日と種類
+              k030 = Counter()  # 府令030の書類（REIT・ETFなど）の種類と、CSV・証券コードの有無
               reit_n = etf_n = 0
               for day in weekdays(DATE_FROM, DATE_TO):
                   time.sleep(1.0)
@@ -162,12 +165,20 @@ jobs:
                       bad.append(f"{day}:{st}")
                       continue
                   try:
-                      docs = [d for d in json.loads(body).get("results", [])
-                              if d.get("docTypeCode") == "120" and d.get("secCode")
-                              and d.get("csvFlag") == "1" and d.get("withdrawalStatus") == "0"]
+                      allres = json.loads(body).get("results", [])
                   except Exception:
                       bad.append(f"{day}:json")
                       continue
+                  for d in allres:
+                      c4 = (d.get("secCode") or "")[:4]
+                      if c4 in CODES:
+                          seen.setdefault(c4, []).append(f"{day[5:]} 種別{d.get('docTypeCode')} csv{d.get('csvFlag')} 取下{d.get('withdrawalStatus')}")
+                      if d.get("ordinanceCode") == "030":
+                          k030[(d.get("docTypeCode"), d.get("formCode"), "csv" + str(d.get("csvFlag")),
+                                "証券コードあり" if d.get("secCode") else "証券コードなし")] += 1
+                  docs = [d for d in allres
+                          if d.get("docTypeCode") == "120" and d.get("secCode")
+                          and d.get("csvFlag") == "1" and d.get("withdrawalStatus") == "0"]
                   for d in docs:
                       d["_date"] = day
                       pool.append(d)
@@ -186,8 +197,10 @@ jobs:
                       break
 
               kind_text = "\n".join(f"府令{o} 様式{f}: {n}件" for (o, f), n in sorted(kinds.items(), key=lambda x: str(x[0])))
+              k030_text = "\n".join(f"府令030 種別{a} 様式{b} {c} {e}: {n}件" for (a, b, c, e), n in sorted(k030.items(), key=lambda x: str(x[0]))[:8])
               note("EDINET走査", f"{DATE_FROM}〜{DATE_TO}（平日のみ）のうち{scanned}日を調べた / 有報{len(pool)}件"
-                   + (f" / 一覧が取れなかった日: {', '.join(bad)}" if bad else "") + f"\n{kind_text}")
+                   + (f" / 一覧が取れなかった日: {', '.join(bad)}" if bad else "") + f"\n{kind_text}"
+                   + (f"\n{k030_text}" if k030_text else "\n府令030の書類: 0件"))
 
               if MODE == "big":
                   chosen = [found[c] for c in CODES if c in found]
@@ -204,7 +217,7 @@ jobs:
                   time.sleep(SLEEP)
                   ok += 1 if analyze(d) else 0
               note("EDINET 集計", f"当期の1株配当が取れた: {ok}/{len(chosen)}件"
-                   + (f"\nその期間の一覧に無かった証券コード: {', '.join(missing)}" if missing else ""))
+                   + "".join(f"\n{c}: 絞り込む前の一覧では " + (" / ".join(seen[c][:4]) if c in seen else "出てこなかった") for c in missing))
 
 
           if __name__ == "__main__":
