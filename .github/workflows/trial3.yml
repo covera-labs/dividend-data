@@ -1,0 +1,228 @@
+name: 試運転3（大手企業の連結・REIT・ETF・決議日を確かめる）
+
+on:
+  workflow_dispatch:
+    inputs:
+      big_from:
+        description: 大手企業を探す期間の最初の日（YYYY-MM-DD）。3月決算の会社は6月下旬に報告書を出します
+        default: "2026-06-17"
+      big_to:
+        description: 大手企業を探す期間の最後の日
+        default: "2026-06-30"
+      codes:
+        description: 試したい会社の証券コード（4桁、カンマ区切り）
+        default: "7203,9432,8306,8058,6758,4502"
+      reit_from:
+        description: REITとETFを探す期間の最初の日
+        default: "2026-09-01"
+      reit_to:
+        description: REITとETFを探す期間の最後の日
+        default: "2026-10-16"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      EDINET_API_KEY: ${{ secrets.EDINET_API_KEY }}
+    steps:
+      - name: 道具を用意する
+        run: |
+          cat > probe3.py <<'END_OF_PROBE'
+          import csv, datetime, io, json, os, sys, time, zipfile
+          import urllib.error, urllib.parse, urllib.request
+          from collections import Counter
+
+          KEY = "".join(os.environ.get("EDINET_API_KEY", "").split())
+          MODE = os.environ.get("MODE", "big")  # big=大手企業 / reit=REITとETF
+          DATE_FROM = os.environ.get("DATE_FROM", "").strip()
+          DATE_TO = os.environ.get("DATE_TO", "").strip()
+          CODES = [c.strip()[:4] for c in os.environ.get("TARGET_CODES", "").split(",") if c.strip()]
+          BASE = os.environ.get("EDINET_BASE", "https://api.edinet-fsa.go.jp/api/v2")
+          SLEEP = float(os.environ.get("SLEEP", "1.2"))
+
+
+          def note(title, msg):
+              # 注記（Annotations）に出す。改行は %0A、% は %25 に直す
+              msg = msg.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::notice title={title}::{msg}")
+
+
+          def get(path, **params):
+              # 通信先のURL（キー入り）は、画面に出さない
+              params["Subscription-Key"] = KEY
+              url = f"{BASE}/{path}?{urllib.parse.urlencode(params)}"
+              last = None
+              for attempt in range(3):
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent": "covera-labs-dividend-data-trial"})
+                      with urllib.request.urlopen(req, timeout=90) as r:
+                          return r.status, r.read()
+                  except urllib.error.HTTPError as e:
+                      last = e.code
+                      if e.code == 429 and attempt < 2:
+                          time.sleep(5 * (attempt + 1))
+                          continue
+                      return e.code, b""
+                  except Exception as e:
+                      last = type(e).__name__
+                      time.sleep(2)
+              return last, b""
+
+
+          def weekdays(a, b, limit=45):
+              d = datetime.date.fromisoformat(a)
+              e = datetime.date.fromisoformat(b)
+              n = 0
+              while d <= e and n < limit:
+                  if d.weekday() < 5:
+                      yield d.isoformat()
+                      n += 1
+                  d += datetime.timedelta(days=1)
+
+
+          def read_rows(zbytes):
+              z = zipfile.ZipFile(io.BytesIO(zbytes))
+              names = [n for n in z.namelist()
+                       if n.lower().endswith(".csv") and "XBRL_TO_CSV" in n
+                       and not os.path.basename(n).startswith("jpaud")]
+              rows = []
+              for n in names:
+                  raw = z.read(n)
+                  try:
+                      text = raw.decode("utf-16")
+                  except UnicodeDecodeError:
+                      text = raw.decode("utf-16-le", errors="replace")
+                  for r in csv.reader(io.StringIO(text.lstrip("﻿")), delimiter="\t", quotechar='"'):
+                      if len(r) >= 9:
+                          rows.append(r)
+              return rows, [os.path.basename(n) for n in names]
+
+
+          def shorten_ctx(c):
+              return (c.replace("NonConsolidatedMember", "個別").replace("ConsolidatedMember", "連結")
+                       .replace("FilingDateInstant", "提出日").replace("CurrentYearDuration", "当期")
+                       .replace("Prior", "前").replace("YearDuration", "期"))
+
+
+          def is_div_per(elem):
+              return ("Dividend" in elem or "Distribution" in elem) and "Per" in elem
+
+
+          def analyze(d):
+              code4 = d["secCode"][:4]
+              head = f"{code4} {d.get('filerName')} / 期末{d.get('periodEnd')} / 提出{d.get('_date')} / 府令{d.get('ordinanceCode')} 様式{d.get('formCode')}"
+              st, zb = get(f"documents/{d['docID']}", type="5")
+              if st != 200 or not zipfile.is_zipfile(io.BytesIO(zb)):
+                  note(f"EDINET {code4}", f"{head}\nCSVを取れませんでした（HTTP {st}）")
+                  return False
+              try:
+                  rows, names = read_rows(zb)
+              except Exception as e:
+                  note(f"EDINET {code4}", f"{head}\nCSVを読めませんでした（{type(e).__name__}）")
+                  return False
+
+              def prio(r):
+                  first = 0 if ("当期" in r[3] or "提出日" in r[3]) else 1
+                  return (first, r[0].split(":")[-1], r[2])
+
+              per = sorted([r for r in rows if is_div_per(r[0].split(":")[-1])], key=prio)
+              table = sorted([r for r in rows if "FilingDateInstant_Row" in r[2]], key=prio)
+              good = any(("当期" in r[3]) and any(ch.isdigit() for ch in r[8]) and ("PerShare" in r[0] or "PerUnit" in r[0])
+                         and "Interim" not in r[0] for r in per)
+              contexts = Counter(shorten_ctx(r[2]) for r in per)
+              lines = []
+              for r in per[:12]:
+                  lines.append(f"{r[0].split(':')[-1].replace('SummaryOfBusinessResults', '')} | {shorten_ctx(r[2])} | {r[3]} | {r[6]} | {r[8][:18]}")
+              tl = []
+              for r in table[:12]:
+                  tl.append(f"{r[0].split(':')[-1]} | {shorten_ctx(r[2])} | {r[8][:28]}")
+              note(f"EDINET {code4}",
+                   f"{head}\n行数{len(rows)} / ファイル{len(names)}個 / 配当の行{len(per)} / 当期の1株配当: {'あり' if good else 'なし'}\n"
+                   + "\n".join(lines)
+                   + ("\n--決議の表--\n" + "\n".join(tl) if tl else "\n--決議の表なし--"))
+              return good
+
+
+          def main():
+              if not KEY:
+                  print("::error title=EDINET::EDINET_API_KEY が空です")
+                  sys.exit(1)
+              pool, kinds, scanned, bad = [], Counter(), 0, []
+              found = {}
+              reit_n = etf_n = 0
+              for day in weekdays(DATE_FROM, DATE_TO):
+                  time.sleep(1.0)
+                  st, body = get("documents.json", date=day, type="2")
+                  scanned += 1
+                  if st != 200:
+                      bad.append(f"{day}:{st}")
+                      continue
+                  try:
+                      docs = [d for d in json.loads(body).get("results", [])
+                              if d.get("docTypeCode") == "120" and d.get("secCode")
+                              and d.get("csvFlag") == "1" and d.get("withdrawalStatus") == "0"]
+                  except Exception:
+                      bad.append(f"{day}:json")
+                      continue
+                  for d in docs:
+                      d["_date"] = day
+                      pool.append(d)
+                      kinds[(d.get("ordinanceCode"), d.get("formCode"))] += 1
+                      c4 = d["secCode"][:4]
+                      if MODE == "big" and c4 in CODES and c4 not in found:
+                          found[c4] = d
+                      if MODE == "reit" and d.get("ordinanceCode") != "010":
+                          if d["secCode"][0] in "389":
+                              reit_n += 1
+                          elif d["secCode"][0] in "12":
+                              etf_n += 1
+                  if MODE == "big" and all(c in found for c in CODES):
+                      break
+                  if MODE == "reit" and reit_n >= 2 and etf_n >= 1:
+                      break
+
+              kind_text = "\n".join(f"府令{o} 様式{f}: {n}件" for (o, f), n in sorted(kinds.items(), key=lambda x: str(x[0])))
+              note("EDINET走査", f"{DATE_FROM}〜{DATE_TO}（平日のみ）のうち{scanned}日を調べた / 有報{len(pool)}件"
+                   + (f" / 一覧が取れなかった日: {', '.join(bad)}" if bad else "") + f"\n{kind_text}")
+
+              if MODE == "big":
+                  chosen = [found[c] for c in CODES if c in found]
+                  missing = [c for c in CODES if c not in found]
+              else:
+                  non = [d for d in pool if d.get("ordinanceCode") != "010"]
+                  reits = [d for d in non if d["secCode"][0] in "389"][:2]
+                  etfs = [d for d in non if d["secCode"][0] in "12"][:1]
+                  rest = [d for d in non if d not in reits and d not in etfs]
+                  chosen = (reits + etfs + rest)[:3]
+                  missing = []
+              ok = 0
+              for d in chosen:
+                  time.sleep(SLEEP)
+                  ok += 1 if analyze(d) else 0
+              note("EDINET 集計", f"当期の1株配当が取れた: {ok}/{len(chosen)}件"
+                   + (f"\nその期間の一覧に無かった証券コード: {', '.join(missing)}" if missing else ""))
+
+
+          if __name__ == "__main__":
+              main()
+          END_OF_PROBE
+
+      - name: 大手企業（連結）
+        env:
+          MODE: big
+          DATE_FROM: ${{ inputs.big_from }}
+          DATE_TO: ${{ inputs.big_to }}
+          TARGET_CODES: ${{ inputs.codes }}
+        run: python3 probe3.py
+
+      - name: REITとETF
+        if: ${{ !cancelled() }}
+        env:
+          MODE: reit
+          DATE_FROM: ${{ inputs.reit_from }}
+          DATE_TO: ${{ inputs.reit_to }}
+        run: python3 probe3.py
