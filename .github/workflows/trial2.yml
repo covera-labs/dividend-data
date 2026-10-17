@@ -1,0 +1,178 @@
+name: 試運転2（EDINETの有価証券報告書から1株配当を取れるか）
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: EDINETで調べる日（YYYY-MM-DD）。有価証券報告書が多い6月下旬の平日がおすすめ
+        default: "2026-06-26"
+      codes:
+        description: 試したい会社の証券コード（4桁、カンマ区切り。その日に報告書が出ていない会社は飛ばします）
+        default: "7203,9432,8306,8058"
+      count:
+        description: 試す会社の数（最大7）
+        default: "6"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      EDINET_API_KEY: ${{ secrets.EDINET_API_KEY }}
+      TARGET_DATE: ${{ inputs.date }}
+      TARGET_CODES: ${{ inputs.codes }}
+      TARGET_COUNT: ${{ inputs.count }}
+    steps:
+      - name: 有価証券報告書から1株配当を探す
+        run: |
+          python3 - <<'PY'
+          import csv, io, json, os, sys, time, zipfile
+          import urllib.error, urllib.parse, urllib.request
+          from collections import Counter
+
+          KEY = "".join(os.environ.get("EDINET_API_KEY", "").split())
+          DATE = os.environ.get("TARGET_DATE", "").strip()
+          CODES = [c.strip() for c in os.environ.get("TARGET_CODES", "").split(",") if c.strip()]
+          try:
+              COUNT = max(1, min(int(os.environ.get("TARGET_COUNT", "6")), 7))
+          except ValueError:
+              COUNT = 6
+          BASE = os.environ.get("EDINET_BASE", "https://api.edinet-fsa.go.jp/api/v2")
+
+          SHORT = {
+              "DividendPaidPerShareSummaryOfBusinessResults": "年間",
+              "InterimDividendPaidPerShareSummaryOfBusinessResults": "中間",
+              "DividendPerShareDividendsOfSurplus": "剰余金表",
+          }
+
+
+          def note(title, msg):
+              # 注記（Annotations）に出す。改行は %0A、% は %25 に直す
+              msg = msg.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::notice title={title}::{msg}")
+
+
+          def get(path, **params):
+              # 通信先のURL（キー入り）は、画面に出さない
+              params["Subscription-Key"] = KEY
+              url = f"{BASE}/{path}?{urllib.parse.urlencode(params)}"
+              last = None
+              for attempt in range(3):
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent": "covera-labs-dividend-data-trial"})
+                      with urllib.request.urlopen(req, timeout=90) as r:
+                          return r.status, r.read()
+                  except urllib.error.HTTPError as e:
+                      last = e.code
+                      if e.code == 429 and attempt < 2:
+                          time.sleep(5 * (attempt + 1))
+                          continue
+                      return e.code, b""
+                  except Exception as e:
+                      last = type(e).__name__
+                      time.sleep(2)
+              return last, b""
+
+
+          def read_rows(zbytes):
+              """書類のZIPから、XBRLを表にしたCSV（タブ区切り・UTF-16）の全行と、ファイル名を返す"""
+              z = zipfile.ZipFile(io.BytesIO(zbytes))
+              names = [n for n in z.namelist()
+                       if n.lower().endswith(".csv") and "XBRL_TO_CSV" in n
+                       and not os.path.basename(n).startswith("jpaud")]
+              rows = []
+              for n in names:
+                  raw = z.read(n)
+                  try:
+                      text = raw.decode("utf-16")
+                  except UnicodeDecodeError:
+                      text = raw.decode("utf-16-le", errors="replace")
+                  text = text.lstrip("﻿")
+                  for r in csv.reader(io.StringIO(text), delimiter="\t", quotechar='"'):
+                      if len(r) >= 9:
+                          rows.append(r)
+              return rows, [os.path.basename(n) for n in names]
+
+
+          def pick_dividend(rows):
+              hit = []
+              other = Counter()
+              for r in rows:
+                  elem = r[0].split(":")[-1]
+                  if elem in SHORT:
+                      hit.append(r)
+                  elif ("Dividend" in elem or "Distribution" in elem) and "Per" in elem:
+                      other[elem] += 1
+              return hit, other
+
+
+          def main():
+              if not KEY:
+                  print("::error title=EDINET::EDINET_API_KEY が空です")
+                  sys.exit(1)
+
+              status, body = get("documents.json", date=DATE, type="2")
+              docs = []
+              if status == 200:
+                  try:
+                      docs = [d for d in json.loads(body).get("results", [])
+                              if d.get("docTypeCode") == "120" and d.get("secCode")
+                              and d.get("csvFlag") == "1" and d.get("withdrawalStatus") == "0"]
+                  except Exception as e:
+                      print("一覧がJSONとして読めませんでした:", type(e).__name__)
+              kinds = Counter((d.get("ordinanceCode"), d.get("formCode")) for d in docs)
+              kind_text = "\n".join(f"府令{o} 様式{f}: {n}件" for (o, f), n in sorted(kinds.items(), key=lambda x: str(x[0])))
+              note("EDINET一覧", f"HTTP {status} / 有価証券報告書 {len(docs)}件\n{kind_text}")
+              if not docs:
+                  sys.exit(1)
+
+              # 試す会社を決める: 指定した証券コード → 特定有価証券（REITなど）を最大2件 → 通常の会社
+              by_code = {d["secCode"]: d for d in docs}
+              chosen, missing = [], []
+              for c in CODES:
+                  d = by_code.get(c + "0" if len(c) == 4 else c)
+                  (chosen if d else missing).append(d if d else c)
+              rest = [d for d in sorted(docs, key=lambda d: d["secCode"]) if d not in chosen]
+              chosen += [d for d in rest if d.get("ordinanceCode") != "010"][:2]
+              chosen += [d for d in rest if d.get("ordinanceCode") == "010"][: max(0, COUNT - len(chosen))]
+              chosen = chosen[:7]
+
+              ok = 0
+              others = Counter()
+              for d in chosen:
+                  time.sleep(1.2)
+                  code4 = d["secCode"][:4]
+                  head = f"{code4} {d.get('filerName')} / 期末{d.get('periodEnd')} / 府令{d.get('ordinanceCode')} 様式{d.get('formCode')}"
+                  st, zb = get(f"documents/{d['docID']}", type="5")
+                  if st != 200 or not zipfile.is_zipfile(io.BytesIO(zb)):
+                      note(f"EDINET {code4}", f"{head}\nCSVを取れませんでした（HTTP {st}）")
+                      continue
+                  try:
+                      rows, names = read_rows(zb)
+                  except Exception as e:
+                      note(f"EDINET {code4}", f"{head}\nCSVを読めませんでした（{type(e).__name__}）")
+                      continue
+                  hit, other = pick_dividend(rows)
+                  others.update(other)
+                  lines = []
+                  for r in sorted(hit, key=lambda r: (r[0].split(":")[-1], r[2]))[:16]:
+                      elem = SHORT[r[0].split(":")[-1]]
+                      lines.append(f"{elem} | {r[2]} | {r[3]} | {r[4]} | {r[7]} | {r[8][:20]}")
+                  good = any(r[0].split(":")[-1] == "DividendPaidPerShareSummaryOfBusinessResults"
+                             and "当期" in r[3] and any(ch.isdigit() for ch in r[8]) for r in hit)
+                  ok += 1 if good else 0
+                  extra = ", ".join(k for k, _ in other.most_common(4)) or "なし"
+                  note(f"EDINET {code4}", f"{head}\n行数{len(rows)} / ファイル{len(names)}個 / 当期の年間配当: {'あり' if good else 'なし'}\n"
+                       + "\n".join(lines) + f"\nほかの配当・分配の項目: {extra}")
+
+              note("EDINET 集計", f"当期の年間1株配当が取れた: {ok}/{len(chosen)}件\n"
+                   f"ほかの配当・分配の項目: {', '.join(f'{k}({v})' for k, v in others.most_common(8)) or 'なし'}\n"
+                   f"この日の一覧に無かった証券コード: {', '.join(missing) or 'なし'}")
+
+
+          if __name__ == "__main__":
+              main()
+          PY
