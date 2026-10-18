@@ -10,14 +10,14 @@ on:
         description: 大手企業を探す期間の最後の日
         default: "2026-06-30"
       codes:
-        description: 試したい会社の証券コード（4桁、カンマ区切り）
-        default: "7203,9432,8058,9984,8035"
+        description: 試したい大手企業の証券コード（4桁、カンマ区切り）。空にすると、大手の探索は飛ばします
+        default: ""
       reit_from:
         description: REITとETFを探す期間の最初の日
-        default: "2026-09-01"
+        default: "2026-04-01"
       reit_to:
         description: REITとETFを探す期間の最後の日
-        default: "2026-10-16"
+        default: "2026-05-29"
 
 permissions:
   contents: read
@@ -113,7 +113,7 @@ jobs:
 
 
           def analyze(d):
-              code4 = d["secCode"][:4]
+              code4 = (d.get("secCode") or d.get("fundCode") or "----")[:4]
               head = f"{code4} {d.get('filerName')} / 期末{d.get('periodEnd')} / 提出{d.get('_date')} / 府令{d.get('ordinanceCode')} 様式{d.get('formCode')}"
               st, zb = get(f"documents/{d['docID']}", type="5")
               if st != 200 or not zipfile.is_zipfile(io.BytesIO(zb)):
@@ -157,6 +157,9 @@ jobs:
               seen = {}  # 指定した会社が、絞り込む前の一覧に出た日と種類
               k030 = Counter()  # 府令030の書類（REIT・ETFなど）の種類と、CSV・証券コードの有無
               reit_n = etf_n = 0
+              cand = []  # REIT・ETFなど（府令010以外の有価証券報告書。証券コードは無くてもよい）
+              reitnames = Counter()  # 「投資法人」を名に含む提出者の、書類の種類
+              reit_samples = []
               for day in weekdays(DATE_FROM, DATE_TO):
                   time.sleep(1.0)
                   st, body = get("documents.json", date=day, type="2")
@@ -176,6 +179,15 @@ jobs:
                       if d.get("ordinanceCode") == "030":
                           k030[(d.get("docTypeCode"), d.get("formCode"), "csv" + str(d.get("csvFlag")),
                                 "証券コードあり" if d.get("secCode") else "証券コードなし")] += 1
+                      fname = d.get("filerName") or ""
+                      if "投資法人" in fname:
+                          reitnames[(d.get("docTypeCode"), d.get("ordinanceCode"), d.get("formCode"), "csv" + str(d.get("csvFlag")))] += 1
+                          if d.get("docTypeCode") == "120" and len(reit_samples) < 4:
+                              reit_samples.append(f"{fname[:16]}({d.get('secCode') or '-'})")
+                      if (MODE == "reit" and d.get("docTypeCode") == "120" and d.get("ordinanceCode") != "010"
+                              and d.get("csvFlag") == "1" and d.get("withdrawalStatus") == "0"):
+                          d["_date"] = day
+                          cand.append(d)
                   docs = [d for d in allres
                           if d.get("docTypeCode") == "120" and d.get("secCode")
                           and d.get("csvFlag") == "1" and d.get("withdrawalStatus") == "0"]
@@ -186,31 +198,35 @@ jobs:
                       c4 = d["secCode"][:4]
                       if MODE == "big" and c4 in CODES and c4 not in found:
                           found[c4] = d
-                      if MODE == "reit" and d.get("ordinanceCode") != "010":
-                          if d["secCode"][0] in "389":
-                              reit_n += 1
-                          elif d["secCode"][0] in "12":
-                              etf_n += 1
                   if MODE == "big" and all(c in found for c in CODES):
                       break
-                  if MODE == "reit" and reit_n >= 2 and etf_n >= 1:
-                      break
+                  if MODE == "reit":
+                      reit_n = sum(1 for d in cand if "投資法人" in (d.get("filerName") or ""))
+                      etf_n = sum(1 for d in cand if "投資法人" not in (d.get("filerName") or ""))
+                      if reit_n >= 2 and etf_n >= 1:
+                          break
 
               kind_text = "\n".join(f"府令{o} 様式{f}: {n}件" for (o, f), n in sorted(kinds.items(), key=lambda x: str(x[0])))
-              k030_text = "\n".join(f"府令030 種別{a} 様式{b} {c} {e}: {n}件" for (a, b, c, e), n in sorted(k030.items(), key=lambda x: str(x[0]))[:8])
+              k120 = {k: n for k, n in k030.items() if k[0] == "120"}
+              other030 = sum(n for k, n in k030.items() if k[0] != "120")
+              k030_text = "\n".join(f"府令030 種別120 様式{b} {c} {e}: {n}件"
+                                    for (a, b, c, e), n in sorted(k120.items(), key=lambda x: -x[1])[:12])
+              reit_text = "\n".join(f"「投資法人」 種別{a} 府令{o} 様式{f} {c}: {n}件"
+                                    for (a, o, f, c), n in sorted(reitnames.items(), key=lambda x: -x[1])[:8])
               note("EDINET走査", f"{DATE_FROM}〜{DATE_TO}（平日のみ）のうち{scanned}日を調べた / 有報{len(pool)}件"
                    + (f" / 一覧が取れなかった日: {', '.join(bad)}" if bad else "") + f"\n{kind_text}"
-                   + (f"\n{k030_text}" if k030_text else "\n府令030の書類: 0件"))
+                   + (f"\n{k030_text}" if k030_text else "\n府令030の有価証券報告書（種別120）: 0件")
+                   + f"\n府令030のうち有価証券報告書以外（届出書など）: {other030}件"
+                   + (f"\n{reit_text}" if reit_text else "\n提出者名に「投資法人」を含む書類: 0件")
+                   + (f"\n有報の例: {', '.join(reit_samples)}" if reit_samples else ""))
 
               if MODE == "big":
                   chosen = [found[c] for c in CODES if c in found]
                   missing = [c for c in CODES if c not in found]
               else:
-                  non = [d for d in pool if d.get("ordinanceCode") != "010"]
-                  reits = [d for d in non if d["secCode"][0] in "389"][:2]
-                  etfs = [d for d in non if d["secCode"][0] in "12"][:1]
-                  rest = [d for d in non if d not in reits and d not in etfs]
-                  chosen = (reits + etfs + rest)[:3]
+                  reits = [d for d in cand if "投資法人" in (d.get("filerName") or "")][:2]
+                  others = [d for d in cand if d not in reits]
+                  chosen = (reits + others)[:3]
                   missing = []
               ok = 0
               for d in chosen:
