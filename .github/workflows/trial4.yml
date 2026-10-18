@@ -1,0 +1,243 @@
+name: 試運転4（分割の見分け方を、300社ほどで試す）
+
+on:
+  workflow_dispatch:
+    inputs:
+      date_from:
+        description: 報告書を探す期間の最初の日（YYYY-MM-DD）
+        default: "2026-06-01"
+      date_to:
+        description: 報告書を探す期間の最後の日
+        default: "2026-06-30"
+      sample:
+        description: 取り出す会社の数（証券コード順にまんべんなく選ぶ。最大600）
+        default: "300"
+      codes:
+        description: 必ず入れたい会社の証券コード（4桁、カンマ区切り）
+        default: "6758,9984,8035,7203,9432,8058,4502,8306"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      EDINET_API_KEY: ${{ secrets.EDINET_API_KEY }}
+      DATE_FROM: ${{ inputs.date_from }}
+      DATE_TO: ${{ inputs.date_to }}
+      SAMPLE: ${{ inputs.sample }}
+      TARGET_CODES: ${{ inputs.codes }}
+    steps:
+      - name: 分割の見分け方を試す
+        run: |
+          python3 - <<'PY'
+          import csv, datetime, io, json, os, sys, time, zipfile
+          import urllib.error, urllib.parse, urllib.request
+          from collections import Counter
+
+          KEY = "".join(os.environ.get("EDINET_API_KEY", "").split())
+          DATE_FROM = os.environ.get("DATE_FROM", "").strip()
+          DATE_TO = os.environ.get("DATE_TO", "").strip()
+          try:
+              SAMPLE = max(1, min(int(os.environ.get("SAMPLE", "300")), 600))
+          except ValueError:
+              SAMPLE = 300
+          MUST = [c.strip()[:4] for c in os.environ.get("TARGET_CODES", "").split(",") if c.strip()]
+          BASE = os.environ.get("EDINET_BASE", "https://api.edinet-fsa.go.jp/api/v2")
+          SLEEP = float(os.environ.get("SLEEP", "1.5"))
+          RATIO_LIMIT = 1.25  # 配当を受けた株数の比がこれを超えたら、分割の疑い
+
+
+          def note(title, msg):
+              # 注記（Annotations）に出す。改行は %0A、% は %25 に直す
+              msg = msg.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::notice title={title}::{msg}")
+
+
+          def get(path, **params):
+              # 通信先のURL（キー入り）は、画面に出さない
+              params["Subscription-Key"] = KEY
+              url = f"{BASE}/{path}?{urllib.parse.urlencode(params)}"
+              last = None
+              for attempt in range(3):
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent": "covera-labs-dividend-data-trial"})
+                      with urllib.request.urlopen(req, timeout=90) as r:
+                          return r.status, r.read()
+                  except urllib.error.HTTPError as e:
+                      last = e.code
+                      if e.code == 429 and attempt < 2:
+                          time.sleep(5 * (attempt + 1))
+                          continue
+                      return e.code, b""
+                  except Exception as e:
+                      last = type(e).__name__
+                      time.sleep(2)
+              return last, b""
+
+
+          def weekdays(a, b, limit=45):
+              d = datetime.date.fromisoformat(a)
+              e = datetime.date.fromisoformat(b)
+              n = 0
+              while d <= e and n < limit:
+                  if d.weekday() < 5:
+                      yield d.isoformat()
+                      n += 1
+                  d += datetime.timedelta(days=1)
+
+
+          def read_rows(zbytes):
+              z = zipfile.ZipFile(io.BytesIO(zbytes))
+              names = [n for n in z.namelist()
+                       if n.lower().endswith(".csv") and "XBRL_TO_CSV" in n
+                       and not os.path.basename(n).startswith("jpaud")]
+              rows = []
+              for n in names:
+                  raw = z.read(n)
+                  try:
+                      text = raw.decode("utf-16")
+                  except UnicodeDecodeError:
+                      text = raw.decode("utf-16-le", errors="replace")
+                  for r in csv.reader(io.StringIO(text.lstrip("﻿")), delimiter="\t", quotechar='"'):
+                      if len(r) >= 9:
+                          rows.append(r)
+              return rows
+
+
+          def num(s):
+              try:
+                  return float(s.replace(",", "").strip())
+              except ValueError:
+                  return None
+
+
+          def pick(cands):
+              """個別の印が付いた行を優先して、最初の数字を返す"""
+              cands = [c for c in cands if c[1] is not None]
+              if not cands:
+                  return None
+              for ctx, v in cands:
+                  if "NonConsolidated" in ctx:
+                      return v
+              return cands[0][1]
+
+
+          def analyze(rows):
+              annual, interim = [], []
+              table = {}
+              for r in rows:
+                  elem = r[0].split(":")[-1]
+                  if elem == "DividendPaidPerShareSummaryOfBusinessResults" and r[3] == "当期":
+                      annual.append((r[2], num(r[8])))
+                  elif elem == "InterimDividendPaidPerShareSummaryOfBusinessResults" and r[3] == "当期":
+                      interim.append((r[2], num(r[8])))
+                  elif "FilingDateInstant_Row" in r[2] and elem in (
+                          "DividendPerShareDividendsOfSurplus", "TotalAmountOfDividendsDividendsOfSurplus",
+                          "DateOfResolutionDividendsOfSurplus"):
+                      t = table.setdefault(r[2], {})
+                      key = {"DividendPerShareDividendsOfSurplus": "dps", "TotalAmountOfDividendsDividendsOfSurplus": "total",
+                             "DateOfResolutionDividendsOfSurplus": "date"}[elem]
+                      t[key] = num(r[8]) if key != "date" else r[8].strip()
+              trows = sorted(([t.get("date", ""), t.get("dps"), t.get("total")] for t in table.values()), key=lambda x: x[0])
+              shares = [t / p for _, p, t in trows if p and t and p > 0 and t > 0]
+              ratio = (max(shares) / min(shares)) if len(shares) >= 2 else None
+              dps_sum = sum(p for _, p, _ in trows if p) if trows else None
+              return {"annual": pick(annual), "interim": pick(interim), "rows": trows, "ratio": ratio, "dps_sum": dps_sum}
+
+
+          def main():
+              if not KEY:
+                  print("::error title=EDINET::EDINET_API_KEY が空です")
+                  sys.exit(1)
+
+              pool, scanned, bad = [], 0, []
+              for day in weekdays(DATE_FROM, DATE_TO):
+                  time.sleep(1.0)
+                  st, body = get("documents.json", date=day, type="2")
+                  scanned += 1
+                  if st != 200:
+                      bad.append(f"{day}:{st}")
+                      continue
+                  try:
+                      for d in json.loads(body).get("results", []):
+                          if (d.get("docTypeCode") == "120" and d.get("secCode") and d.get("csvFlag") == "1"
+                                  and d.get("withdrawalStatus") == "0" and d.get("ordinanceCode") == "010"):
+                              d["_date"] = day
+                              pool.append(d)
+                  except Exception:
+                      bad.append(f"{day}:json")
+              pool.sort(key=lambda d: d["secCode"])
+              if not pool:
+                  note("EDINET走査", f"有報が0件でした。一覧が取れなかった日: {', '.join(bad) or 'なし'}")
+                  sys.exit(1)
+
+              # 証券コード順に、まんべんなく選ぶ。指定した会社は、必ず入れる
+              step = len(pool) / min(SAMPLE, len(pool))
+              chosen = [pool[int(i * step)] for i in range(min(SAMPLE, len(pool)))]
+              by4 = {d["secCode"][:4]: d for d in pool}
+              missing = [c for c in MUST if c not in by4]
+              for c in MUST:
+                  if c in by4 and by4[c] not in chosen:
+                      chosen.append(by4[c])
+              note("EDINET走査", f"{DATE_FROM}〜{DATE_TO}（平日のみ）のうち{scanned}日を調べた / 有報{len(pool)}件 / 取り出す{len(chosen)}件"
+                   + (f"\n一覧が取れなかった日: {', '.join(bad)}" if bad else "")
+                   + (f"\nこの期間に無かった指定の会社: {', '.join(missing)}" if missing else ""))
+
+              results, fails, consecutive = [], 0, 0
+              for d in chosen:
+                  time.sleep(SLEEP)
+                  st, zb = get(f"documents/{d['docID']}", type="5")
+                  if st != 200 or not zipfile.is_zipfile(io.BytesIO(zb)):
+                      fails += 1
+                      consecutive += 1
+                      if consecutive >= 4:
+                          note("EDINET中止", f"続けて4回取れなかったので、ここで止めた（最後のHTTP {st}）。取れた件数: {len(results)}")
+                          break
+                      continue
+                  consecutive = 0
+                  try:
+                      a = analyze(read_rows(zb))
+                  except Exception as e:
+                      fails += 1
+                      continue
+                  a.update(code=d["secCode"][:4], name=(d.get("filerName") or "")[:12], must=d["secCode"][:4] in MUST)
+                  results.append(a)
+
+              two = [r for r in results if r["ratio"] is not None]
+              flagged = [r for r in two if r["ratio"] > RATIO_LIMIT]
+              mism = [r for r in results if r["annual"] is not None and r["dps_sum"] and r["rows"]
+                      and abs(r["dps_sum"] - r["annual"]) > max(0.01, 0.005 * r["annual"])]
+              edges = [1.02, 1.05, 1.10, 1.25, 1.75, 3.5]
+              hist = Counter()
+              for r in two:
+                  k = sum(1 for e in edges if r["ratio"] >= e)
+                  hist[k] += 1
+              labels = ["〜1.02", "1.02〜1.05", "1.05〜1.10", "1.10〜1.25", "1.25〜1.75", "1.75〜3.5", "3.5〜"]
+              note("EDINET集計",
+                   f"読めた{len(results)}件 / 取れなかった{fails}件\n"
+                   f"年間の1株配当が取れた: {sum(1 for r in results if r['annual'] is not None)}件\n"
+                   f"決議の表が2行以上（比を出せた）: {len(two)}件 / 1行以下（出せない）: {len(results) - len(two)}件\n"
+                   f"比が{RATIO_LIMIT}を超えた（分割の疑い）: {len(flagged)}件\n"
+                   f"年間と決議の表の合計が合わない: {len(mism)}件\n"
+                   "比の分布: " + " / ".join(f"{labels[i]}:{hist.get(i, 0)}" for i in range(len(labels))))
+
+              def line(r):
+                  rows = "; ".join(f"{(x[0] or '?')[5:]}:{x[1]}" for x in r["rows"][:4])
+                  ratio = f"比{r['ratio']:.2f}" if r["ratio"] else "比なし"
+                  return f"{r['code']} {r['name']} | {ratio} | 年間{r['annual']} 中間{r['interim']} | {rows}"
+
+              if flagged:
+                  note("分割の疑い", "\n".join(line(r) for r in sorted(flagged, key=lambda r: -r["ratio"])[:40]))
+              if mism:
+                  note("年間と表の合計が合わない", "\n".join(line(r) + f" | 表の合計{r['dps_sum']}" for r in mism[:30]))
+              known = [r for r in results if r["must"]]
+              if known:
+                  note("指定した会社", "\n".join(line(r) for r in known))
+
+
+          if __name__ == "__main__":
+              main()
+          PY
